@@ -25,12 +25,15 @@ start_update(Partial, State, NumChanges, NumChangesDone) ->
     QueueOpts = [{max_size, MaxSize}, {max_items, MaxItems}],
     {ok, DocQueue} = couch_work_queue:new(QueueOpts),
     {ok, WriteQueue} = couch_work_queue:new(QueueOpts),
+    FirstBuild = State#mrst.update_seq == 0,
+    Emsort = init_emsort(State#mrst.fd, State#mrst.views, FirstBuild),
     InitState = State#mrst{
-        first_build = State#mrst.update_seq == 0,
+        first_build = FirstBuild,
         partial_resp_pid = Partial,
         doc_acc = [],
         doc_queue = DocQueue,
-        write_queue = WriteQueue
+        write_queue = WriteQueue,
+        emsort = Emsort
     },
 
     Self = self(),
@@ -145,7 +148,8 @@ finish_update(#mrst{doc_acc = Acc} = State) ->
                 doc_acc = undefined,
                 doc_queue = undefined,
                 write_queue = undefined,
-                qserver = nil
+                qserver = nil,
+                emsort = undefined
             }}
     end.
 
@@ -186,14 +190,21 @@ map_docs(Parent, #mrst{db_name = DbName, idx_name = IdxName} = State0) ->
 write_results(Parent, #mrst{} = State) ->
     case accumulate_writes(State, State#mrst.write_queue, nil) of
         stop ->
-            Parent ! {new_state, State};
+            FinalState = maybe_flush_emsort(State),
+            Parent ! {new_state, FinalState};
         {Go, {Seq, ViewKVs, DocIdKeys}} ->
             NewState = write_kvs(State, Seq, ViewKVs, DocIdKeys),
             if
                 Go == stop ->
-                    Parent ! {new_state, NewState};
+                    FinalState = maybe_flush_emsort(NewState),
+                    Parent ! {new_state, FinalState};
                 true ->
-                    send_partial(NewState#mrst.partial_resp_pid, NewState),
+                    case NewState#mrst.emsort of
+                        undefined ->
+                            send_partial(NewState#mrst.partial_resp_pid, NewState);
+                        _ ->
+                            ok
+                    end,
                     write_results(Parent, NewState)
             end
     end.
@@ -278,7 +289,14 @@ insert_results(DocId, [KVs | RKVs], [{Id, VKVs} | RVKVs], VKVAcc, VIdKeys) ->
     FinalKVs = [{{Key, DocId}, Val} || {Key, Val} <- Duped] ++ VKVs,
     insert_results(DocId, RKVs, RVKVs, [{Id, FinalKVs} | VKVAcc], VIdKeys0).
 
+write_kvs(#mrst{first_build = true, emsort = Emsort} = State, UpdateSeq, ViewKVs, DocIdKeys) when
+    is_map(Emsort)
+->
+    write_kvs_emsort(State, UpdateSeq, ViewKVs, DocIdKeys);
 write_kvs(State, UpdateSeq, ViewKVs, DocIdKeys) ->
+    write_kvs_btree(State, UpdateSeq, ViewKVs, DocIdKeys).
+
+write_kvs_btree(State, UpdateSeq, ViewKVs, DocIdKeys) ->
     #mrst{
         id_btree = IdBtree,
         first_build = FirstBuild,
@@ -315,6 +333,37 @@ write_kvs(State, UpdateSeq, ViewKVs, DocIdKeys) ->
         views = lists:zipwith(UpdateView, State#mrst.views, ViewKVs),
         update_seq = UpdateSeq,
         id_btree = IdBtree2
+    }.
+
+write_kvs_emsort(State, UpdateSeq, ViewKVs, DocIdKeys) ->
+    #mrst{
+        emsort = Emsort0,
+        partitioned = Partitioned
+    } = State,
+
+    % Add id entries to id emsort
+    IdKVs = [{DocId, DIKeys} || {DocId, DIKeys} <- DocIdKeys, DIKeys /= []],
+    {ok, IdEms} = couch_emsort:add(maps:get(id, Emsort0), IdKVs),
+    Emsort1 = Emsort0#{id := IdEms},
+
+    % Add view entries to per-view emsort
+    Emsort2 = lists:foldl(
+        fun({ViewId, KVs0}, EmsAcc) ->
+            KVs =
+                case Partitioned of
+                    true -> inject_partition(KVs0);
+                    false -> KVs0
+                end,
+            {ok, ViewEms} = couch_emsort:add(maps:get(ViewId, EmsAcc), KVs),
+            EmsAcc#{ViewId := ViewEms}
+        end,
+        Emsort1,
+        ViewKVs
+    ),
+
+    State#mrst{
+        update_seq = UpdateSeq,
+        emsort = Emsort2
     }.
 
 inject_partition(Rows) ->
@@ -381,3 +430,62 @@ maybe_notify(State, View, KVs, ToRem) ->
         [Key || {Key, _DocId} <- ToRem]
     end,
     couch_index_plugin:index_update(State, View, Updated, Removed).
+
+init_emsort(Fd, Views, true) ->
+    {ok, IdEms} = couch_emsort:open(Fd),
+    ViewEmsMap = lists:foldl(
+        fun(#mrview{id_num = IdNum}, Acc) ->
+            {ok, Ems} = couch_emsort:open(Fd),
+            Acc#{IdNum => Ems}
+        end,
+        #{id => IdEms},
+        Views
+    ),
+    ViewEmsMap;
+init_emsort(_Fd, _Views, _FirstBuild) ->
+    undefined.
+
+maybe_flush_emsort(#mrst{first_build = true, emsort = Emsort} = State) when is_map(Emsort) ->
+    NoopReporter = fun(_) -> ok end,
+
+    % Merge and write id btree
+    {ok, IdEmsMerged} = couch_emsort:merge(maps:get(id, Emsort), NoopReporter),
+    {ok, IdIter} = couch_emsort:iter(IdEmsMerged),
+    IdBtree = write_emsort_to_btree(IdIter, State#mrst.id_btree),
+
+    % Merge and write each view btree
+    UpdateSeq = State#mrst.update_seq,
+    Views = lists:map(
+        fun(#mrview{id_num = IdNum} = View) ->
+            {ok, ViewEmsMerged} = couch_emsort:merge(maps:get(IdNum, Emsort), NoopReporter),
+            {ok, ViewIter} = couch_emsort:iter(ViewEmsMerged),
+            NewBtree = write_emsort_to_btree(ViewIter, View#mrview.btree),
+            View#mrview{btree = NewBtree, update_seq = UpdateSeq}
+        end,
+        State#mrst.views
+    ),
+
+    State#mrst{
+        id_btree = IdBtree,
+        views = Views,
+        emsort = undefined
+    };
+maybe_flush_emsort(State) ->
+    State.
+
+write_emsort_to_btree(Iter, Btree) ->
+    write_emsort_to_btree(Iter, Btree, []).
+
+write_emsort_to_btree(Iter, Btree, Acc) when length(Acc) >= 1000 ->
+    {ok, Btree2} = couch_btree:add(Btree, lists:reverse(Acc)),
+    write_emsort_to_btree(Iter, Btree2, []);
+write_emsort_to_btree(Iter, Btree, Acc) ->
+    case couch_emsort:next(Iter) of
+        {ok, KV, NextIter} ->
+            write_emsort_to_btree(NextIter, Btree, [KV | Acc]);
+        finished when Acc == [] ->
+            Btree;
+        finished ->
+            {ok, Btree2} = couch_btree:add(Btree, lists:reverse(Acc)),
+            Btree2
+    end.
